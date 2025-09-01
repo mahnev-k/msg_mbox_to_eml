@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 from email.utils import formatdate, parsedate_tz, mktime_tz
-from email.header import decode_header
+from email.header import decode_header, Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -31,93 +31,341 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
 
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".msg_to_eml_config.json")
 
 class MessageConverter:
-    
+    def generate_safe_filename(self, original_path, new_extension):
+        base_name = os.path.splitext(os.path.basename(original_path))[0]
+        safe_name = sanitize_filename(base_name)
+        
+        if not safe_name:
+            safe_name = "converted_message"
+        
+        return safe_name + new_extension
+
+    def parse_msg_date(self, date_obj):
+        """Парсинг даты из MSG объекта"""
+        if date_obj is None:
+            return datetime.now()
+            
+        if isinstance(date_obj, datetime):
+            return date_obj
+            
+        if isinstance(date_obj, str):
+            try:
+                for fmt in ['%a, %d %b %Y %H:%M:%S %z', '%d %b %Y %H:%M:%S', '%Y-%m-%d %H:%M:%S']:
+                    try:
+                        return datetime.strptime(date_obj, fmt)
+                    except ValueError:
+                        continue
+            except:
+                pass
+        
+        return datetime.now()
+
+    def process_html_with_inline_images(self, html, inline_attachments, cid_mapping):
+
+        if not html or not inline_attachments:
+            return html
+
+        if isinstance(html, bytes):
+            html = html.decode('utf-8', errors='replace')
+
+        def repl(match):
+            src = match.group(1)
+            if src.lower().startswith("cid:"):
+                cid = src[4:].strip('<>')
+                
+                for att in inline_attachments:
+                    att_cid = getattr(att, 'cid', None) or getattr(att, 'contentId', None)
+                    if att_cid and att_cid.strip('<>') == cid:
+                        filename = (getattr(att, 'longFilename', None) or 
+                                getattr(att, 'shortFilename', None) or 
+                                f"image_{hashlib.md5(cid.encode()).hexdigest()[:8]}")
+                        
+                        cid_mapping[filename] = cid
+                        
+                        return f'src="cid:{cid}"'
+            
+            return match.group(0)
+
+        return re.sub(r'src=["\']cid:([^"\']+)["\']', repl, html, flags=re.IGNORECASE)
+
+    def is_inline_attachment(self, attachment):
+
+        try:
+            cid = getattr(attachment, 'cid', None) or getattr(attachment, 'contentId', None)
+            if cid:
+                return True
+                
+            content_disposition = getattr(attachment, 'contentDisposition', '') or ''
+            if 'inline' in content_disposition.lower():
+                return True
+                
+            filename = (getattr(attachment, 'longFilename', None) or 
+                    getattr(attachment, 'shortFilename', None) or '')
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                return True
+                
+            mime_type = getattr(attachment, 'mimeType', None)
+            if mime_type and mime_type.startswith('image/'):
+                return True
+                
+        except Exception:
+            pass
+            
+        return False
+
+    def decode_text(self, text):
+      if text is None:
+            return ""
+        
+      if isinstance(text, bytes):
+            try:
+                for encoding in ['utf-8', 'cp1251', 'koi8-r', 'iso-8859-1', 'cp866']:
+                    try:
+                        return text.decode(encoding)
+                    except UnicodeDecodeError:
+                        continue
+                return text.decode('utf-8', errors='replace')
+            except Exception:
+                return str(text)
+      else:
+           return str(text)
+
+    def get_safe_recipients(self, recipients):
+
+        if not recipients:
+            return ""
+        
+        recipient_list = []
+        for recipient in recipients:
+            if hasattr(recipient, 'email') and recipient.email:
+                recipient_list.append(recipient.email)
+            elif hasattr(recipient, 'display_name') and recipient.display_name:
+                recipient_list.append(recipient.display_name)
+            elif isinstance(recipient, str):
+                recipient_list.append(recipient)
+            else:
+                try:
+                    recipient_list.append(str(recipient))
+                except:
+                    recipient_list.append("Unknown")
+        
+        return ", ".join(recipient_list)
+
     def __init__(self, output_dir):
         self.output_dir = output_dir
 
+    def encode_header(self, text):
+        if not text:
+            return ""
+        try:
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
+            if any(ord(c) > 127 for c in text):
+                from email.header import Header
+                return str(Header(text, 'utf-8'))
+            return text
+        except Exception as e:
+            logger.error(f"Ошибка кодирования заголовка: {e}")
+            return str(text)
+
     def convert_msg_to_eml(self, msg_path):
-       
         try:
             msg = extract_msg.Message(msg_path)
             
-            eml = MIMEMultipart('mixed')
-            
-            eml['Subject'] = self.encode_header(msg.subject or '')
-            eml['From'] = self.encode_header(msg.sender or '')
-            eml['To'] = self.encode_header(msg.to or '')
-            eml['Date'] = formatdate(localtime=True)
-            eml['Message-ID'] = f"<{hashlib.md5(str(time.time()).encode()).hexdigest()}@msg-converter>"
-            eml['MIME-Version'] = '1.0'
-            
-            alt = MIMEMultipart('alternative')
-            
-            if msg.body:
-                text_part = MIMEText(msg.body, 'plain', 'utf-8')
-                alt.attach(text_part)
-            
-            if msg.htmlBody:
-                try:
-                    html_content = msg.htmlBody
-                    if isinstance(html_content, bytes):
-                        html_content = html_content.decode('utf-8', errors='replace')
-                    html_part = MIMEText(html_content, 'html', 'utf-8')
-                    alt.attach(html_part)
-                except Exception as e:
-                    logger.error(f"Ошибка при обработке HTML: {e}")
-            
-            eml.attach(alt)
-            
-            for att in msg.attachments:
-                try:
-                    filename = att.longFilename or att.shortFilename or 'attachment.bin'
-                    filename = self.encode_header(filename)
+            msg_sender = getattr(msg, 'sender', None) or ""
+            recipients = getattr(msg, 'recipients', None)
+            if recipients is None:
+              recipients = getattr(msg, 'to', None) or getattr(msg, 'display_to', None)
+            msg_to = self.get_safe_recipients(recipients) if recipients else ""
+            msg_subject = getattr(msg, 'subject', None) or ""
+            msg_body = self.decode_text(getattr(msg, 'body', None))
+            msg_html = self.decode_text(getattr(msg, 'htmlBody', None))
+
+            attachments = getattr(msg, 'attachments', [])
+            inline_attachments = []
+            regular_attachments = []
+            cid_mapping = {} 
+
+            for att in attachments:
+                if self.is_inline_attachment(att):
+                    inline_attachments.append(att)
+                else:
+                    regular_attachments.append(att)
+
+            if msg_html and inline_attachments:
+                msg_html = self.process_html_with_inline_images(msg_html, inline_attachments, cid_mapping)
+
+            if not msg_body and not msg_html:
+                outer = email.mime.text.MIMEText("", "plain", "utf-8")
+            elif msg_html and not msg_body:
+                if inline_attachments:
+                    outer = MIMEMultipart("related")
+                    html_part = MIMEText(msg_html, "html", "utf-8")
+                    outer.attach(html_part)
                     
-                    mime_type, _ = mimetypes.guess_type(filename)
-                    if not mime_type:
-                        mime_type = 'application/octet-stream'
-                    maintype, subtype = mime_type.split('/')
+                    for att in inline_attachments:
+                        self.process_inline_attachment(att, outer, cid_mapping)
+                else:
+                    outer = MIMEText(msg_html, "html", "utf-8")
+            elif msg_body and not msg_html:
+                outer = MIMEText(msg_body, "plain", "utf-8")
+            else:
+                if inline_attachments:
+                    outer = MIMEMultipart("alternative")
                     
-                    part = MIMEBase(maintype, subtype)
-                    part.set_payload(att.data)
-                    encoders.encode_base64(part)
+                    text_part = MIMEText(msg_body, "plain", "utf-8")
+                    outer.attach(text_part)
                     
-                    part.add_header('Content-Disposition', 'attachment', filename=filename)
+                    html_related = MIMEMultipart("related")
+                    html_part = MIMEText(msg_html, "html", "utf-8")
+                    html_related.attach(html_part)
                     
-                    if hasattr(att, 'cid') and att.cid:
-                        part.add_header('Content-ID', f'<{att.cid}>')
-                        part.add_header('X-Attachment-Id', att.cid)
+                    for att in inline_attachments:
+                        self.process_inline_attachment(att, html_related, cid_mapping)
                     
-                    eml.attach(part)
-                except Exception as e:
-                    logger.error(f"Ошибка при обработке вложения {filename}: {e}")
-                    continue
+                    outer.attach(html_related)
+                else:
+                    outer = MIMEMultipart("alternative")
+                    outer.attach(MIMEText(msg_body, "plain", "utf-8"))
+                    outer.attach(MIMEText(msg_html, "html", "utf-8"))
+
+            if regular_attachments:
+                if isinstance(outer, MIMEMultipart):
+                    mixed_outer = MIMEMultipart("mixed")
+                    for key, value in outer.items():
+                        mixed_outer[key] = value
+                    mixed_outer.attach(outer)
+                else:
+                    mixed_outer = MIMEMultipart("mixed")
+                    for key, value in outer.items():
+                        mixed_outer[key] = value
+                    mixed_outer.attach(outer)
+                
+                outer = mixed_outer
+
+                for att in regular_attachments:
+                    try:
+                        self.process_regular_attachment(att, outer)
+                    except Exception as e:
+                        logger.warning(f"Ошибка при обработке вложения: {str(e)}")
+                        continue
+
+            outer["Subject"] = msg_subject
+            outer["From"] = msg_sender
+            outer["To"] = msg_to
+            outer["Message-ID"] = f"<{hash(msg_path)}@converted.local>"
             
-            basename = os.path.splitext(os.path.basename(msg_path))[0]
-            safe_name = sanitize_filename(basename or msg.subject or 'message')
-            eml_path = os.path.join(self.output_dir, f"{safe_name}.eml")
+            msg_date = None
+            if hasattr(msg, 'date') and msg.date:
+                msg_date = self.parse_msg_date(msg.date)
+            else:
+                for attr in ['creationTime', 'lastModificationTime', 'receivedTime']:
+                    if hasattr(msg, attr):
+                        attr_value = getattr(msg, attr)
+                        if attr_value:
+                            msg_date = self.parse_msg_date(attr_value)
+                            break
+
+            if not msg_date:
+                msg_date = datetime.now()
+
+            try:
+                formatted_date = formatdate(msg_date.timestamp(), localtime=True)
+            except:
+                formatted_date = formatdate(time.time(), localtime=True)
+
+            outer["Date"] = formatted_date
+
+            outer["MIME-Version"] = "1.0"
+
+            out_filename = self.generate_safe_filename(msg_path, ".eml")
+            out_path = os.path.join(self.output_dir, out_filename)
             
-            os.makedirs(os.path.dirname(eml_path), exist_ok=True)
-            
-            with open(eml_path, 'wb') as f:
-                generator = email.generator.BytesGenerator(f, policy=email.policy.SMTP)
-                generator.flatten(eml)
-            
-            return eml_path
-            
+            with open(out_path, "w", encoding="utf-8", newline='\n') as f:
+                f.write(outer.as_string())
+
+            logger.info(f"Успешно конвертирован: {msg_path} -> {out_path}")
+            return out_path
+
         except Exception as e:
             logger.error(f"Ошибка конвертации MSG файла {msg_path}: {str(e)}")
             raise
 
+    def process_inline_attachment(self, att, parent, cid_mapping):
+        filename = (getattr(att, 'longFilename', None) or 
+                   getattr(att, 'shortFilename', None) or 
+                   "inline_image")
+        
+        data = getattr(att, 'data', None)
+        if data is None:
+            return
+            
+        if isinstance(data, str):
+            data = data.encode(errors="replace")
+        elif not isinstance(data, bytes):
+            data = bytes(data)
+
+        mime_type, _ = mimetypes.guess_type(filename)
+        if mime_type and mime_type.startswith('image/'):
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "image", "png"
+
+        if maintype == "image":
+            attachment = MIMEImage(data, subtype)
+        else:
+            attachment = MIMEBase(maintype, subtype)
+            attachment.set_payload(data)
+            encoders.encode_base64(attachment)
+
+        if filename in cid_mapping:
+            cid = cid_mapping[filename]
+        else:
+            existing_cid = getattr(att, 'cid', None) or getattr(att, 'contentId', None)
+            if existing_cid:
+                cid = existing_cid.strip('<>')
+            else:
+                cid = f"img_{hashlib.md5(filename.encode()).hexdigest()[:8]}"
+        
+        attachment.add_header("Content-ID", f"<{cid}>")
+        attachment.add_header("Content-Disposition", "inline", filename=filename)
+        
+        parent.attach(attachment)
+
+    def process_regular_attachment(self, att, outer):
+        """Обработка обычных вложений"""
+        filename = (getattr(att, 'longFilename', None) or 
+                   getattr(att, 'shortFilename', None) or 
+                   "attachment")
+        
+        data = getattr(att, 'data', None)
+        if data is None:
+            return
+            
+        if isinstance(data, str):
+            data = data.encode(errors="replace")
+        elif not isinstance(data, bytes):
+            data = bytes(data)
+
+        mime_type, _ = mimetypes.guess_type(filename)
+        if mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+
+        attachment = MIMEBase(maintype, subtype)
+        attachment.set_payload(data)
+        encoders.encode_base64(attachment)
+        attachment.add_header("Content-Disposition", "attachment", filename=filename)
+        attachment.add_header("Content-Transfer-Encoding", "base64")
+        outer.attach(attachment)
     def convert_mbox_to_eml(self, mbox_path):
-        """Конвертация MBOX в набор EML"""
         try:
             messages = safe_mbox_loader(mbox_path)
             converted = []
@@ -141,23 +389,6 @@ class MessageConverter:
         except Exception as e:
             logger.error(f"Ошибка конвертации MBOX файла {mbox_path}: {str(e)}")
             raise
-
-    def encode_header(self, text):
-        if not text:
-            return ""
-        
-        try:
-            if isinstance(text, bytes):
-                text = text.decode('utf-8', errors='replace')
-            
-            if any(ord(c) > 127 for c in text):
-                from email.header import Header
-                return str(Header(text, 'utf-8'))
-            
-            return text
-        except Exception as e:
-            logger.error(f"Ошибка кодирования заголовка: {e}")
-            return str(text)
 
 def load_config():
     default_config = {
@@ -243,7 +474,17 @@ def parse_mbox_manually(mbox_path, encoding='utf-8'):
 
 def save_attachment(data, filename, parent=None):
     try:
-        save_path, _ = QFileDialog.getSaveFileName(parent, "Сохранить вложение", filename)
+        default_dir = os.path.join(os.path.expanduser("~"), "./")
+        os.makedirs(default_dir, exist_ok=True)
+        
+        default_path = os.path.join(default_dir, filename)
+        
+        save_path, _ = QFileDialog.getSaveFileName(
+            parent, 
+            "Сохранить вложение", 
+            default_path,  
+            "Все файлы (*.*)"
+        )
         if save_path:
             with open(save_path, "wb") as f:
                 f.write(data)
@@ -253,7 +494,14 @@ def save_attachment(data, filename, parent=None):
 
 def save_attachments_bulk(attachments, parent=None):
     try:
-        dir_path = QFileDialog.getExistingDirectory(parent, "Выберите папку для сохранения")
+        default_dir = os.path.join(os.path.expanduser("~"), "./")
+        os.makedirs(default_dir, exist_ok=True)
+        
+        dir_path = QFileDialog.getExistingDirectory(
+            parent, 
+            "Выберите папку для сохранения",
+            default_dir  
+        )
         if dir_path:
             for name, data in attachments:
                 path = os.path.join(dir_path, name)
@@ -581,6 +829,7 @@ class MboxPreviewDialog(QDialog):
         return decode_header_safe(header_value)
 
     def decode_payload_safe(self, part):
+        """Безопасное декодирование содержимого письма"""
         try:
             payload = part.get_payload(decode=True)
             if isinstance(payload, bytes):
@@ -764,7 +1013,7 @@ class MsgToEmlConverter(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MSG and MBOX → EML Конвертер")
-        self.resize(680, 480)
+        self.resize(650, 500)
 
         self.config = load_config()
         self.output_dir = self.config["output_dir"]
@@ -773,17 +1022,15 @@ class MsgToEmlConverter(QWidget):
 
         self.conversion_worker = None
         
-        self.preview_selected_file = self.preview_selected_file  # Add this line
-        self.preview_file = self.preview_file  # Add this line
-        
         self.init_ui()
 
-        if self.config.get("dark_theme", True):
-            self.set_dark_theme()
-            self.theme_checkbox.setChecked(True)
-        else:
+        if self.config.get("light_theme", True):
             self.set_light_theme()
             self.theme_checkbox.setChecked(False)
+        else:
+            self.set_dark_theme()
+            self.theme_checkbox.setChecked(True)
+
 
     def preview_selected_file(self):
         current_item = self.list_widget.currentItem()
@@ -811,7 +1058,7 @@ class MsgToEmlConverter(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-
+        
         top_bar = QHBoxLayout()
         self.label = QLabel("Перетащите файлы .msg или .mbox, или выберите вручную:")
         top_bar.addWidget(self.label)
@@ -861,7 +1108,13 @@ class MsgToEmlConverter(QWidget):
         self.progress.setFormat("%p%")
         layout.addWidget(self.progress)
 
+        mk_label = QLabel("MK")
+        mk_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        mk_label.setStyleSheet("color: gray; padding: 1px;")
+        layout.addWidget(mk_label)        
+
     def preview_selected_file(self):
+        """Предпросмотр выбранного файла"""
         current_item = self.list_widget.currentItem()
         if current_item:
             self.preview_file(current_item)
@@ -978,7 +1231,8 @@ class MsgToEmlConverter(QWidget):
 
     def select_files(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Выберите MSG файлы", "",
+            self, "Выберите MSG файлы", 
+            os.path.expanduser("~"),  # Начинать с домашнего каталога
             "MSG файлы (*.msg);;Все файлы (*.*)"
         )
         if files:
@@ -986,7 +1240,8 @@ class MsgToEmlConverter(QWidget):
 
     def select_mbox_files(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Выберите MBOX файлы", "",
+            self, "Выберите MBOX файлы", 
+            os.path.expanduser("~"),  # Начинать с домашнего каталога
             "MBOX файлы (*.mbox *.mbx);;Все файлы (*.*)"
         )
         if files:
@@ -1033,8 +1288,6 @@ class MsgToEmlConverter(QWidget):
             self, "Готово",
             f"Конвертация завершена.\nФайлы сохранены в:\n{self.output_dir}"
         )
-
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
