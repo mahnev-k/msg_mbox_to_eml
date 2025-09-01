@@ -1,0 +1,1044 @@
+import sys
+import os
+import mimetypes
+import extract_msg
+import mailbox
+import email
+import subprocess
+import logging
+import re
+import hashlib
+import time
+import base64
+import codecs
+import json
+from pathlib import Path
+from datetime import datetime
+from email.utils import formatdate, parsedate_tz, mktime_tz
+from email.header import decode_header
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
+from email import encoders
+from email.message import EmailMessage
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QFileDialog,
+    QListWidget, QMessageBox, QProgressBar, QHBoxLayout, QToolButton, QMenu,
+    QAction, QDialog, QTextEdit, QListWidgetItem, QRadioButton,
+    QAbstractItemView
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QIcon
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".msg_to_eml_config.json")
+
+class MessageConverter:
+    
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+
+    def convert_msg_to_eml(self, msg_path):
+       
+        try:
+            msg = extract_msg.Message(msg_path)
+            
+            eml = MIMEMultipart('mixed')
+            
+            eml['Subject'] = self.encode_header(msg.subject or '')
+            eml['From'] = self.encode_header(msg.sender or '')
+            eml['To'] = self.encode_header(msg.to or '')
+            eml['Date'] = formatdate(localtime=True)
+            eml['Message-ID'] = f"<{hashlib.md5(str(time.time()).encode()).hexdigest()}@msg-converter>"
+            eml['MIME-Version'] = '1.0'
+            
+            alt = MIMEMultipart('alternative')
+            
+            if msg.body:
+                text_part = MIMEText(msg.body, 'plain', 'utf-8')
+                alt.attach(text_part)
+            
+            if msg.htmlBody:
+                try:
+                    html_content = msg.htmlBody
+                    if isinstance(html_content, bytes):
+                        html_content = html_content.decode('utf-8', errors='replace')
+                    html_part = MIMEText(html_content, 'html', 'utf-8')
+                    alt.attach(html_part)
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке HTML: {e}")
+            
+            eml.attach(alt)
+            
+            for att in msg.attachments:
+                try:
+                    filename = att.longFilename or att.shortFilename or 'attachment.bin'
+                    filename = self.encode_header(filename)
+                    
+                    mime_type, _ = mimetypes.guess_type(filename)
+                    if not mime_type:
+                        mime_type = 'application/octet-stream'
+                    maintype, subtype = mime_type.split('/')
+                    
+                    part = MIMEBase(maintype, subtype)
+                    part.set_payload(att.data)
+                    encoders.encode_base64(part)
+                    
+                    part.add_header('Content-Disposition', 'attachment', filename=filename)
+                    
+                    if hasattr(att, 'cid') and att.cid:
+                        part.add_header('Content-ID', f'<{att.cid}>')
+                        part.add_header('X-Attachment-Id', att.cid)
+                    
+                    eml.attach(part)
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке вложения {filename}: {e}")
+                    continue
+            
+            basename = os.path.splitext(os.path.basename(msg_path))[0]
+            safe_name = sanitize_filename(basename or msg.subject or 'message')
+            eml_path = os.path.join(self.output_dir, f"{safe_name}.eml")
+            
+            os.makedirs(os.path.dirname(eml_path), exist_ok=True)
+            
+            with open(eml_path, 'wb') as f:
+                generator = email.generator.BytesGenerator(f, policy=email.policy.SMTP)
+                generator.flatten(eml)
+            
+            return eml_path
+            
+        except Exception as e:
+            logger.error(f"Ошибка конвертации MSG файла {msg_path}: {str(e)}")
+            raise
+
+    def convert_mbox_to_eml(self, mbox_path):
+        """Конвертация MBOX в набор EML"""
+        try:
+            messages = safe_mbox_loader(mbox_path)
+            converted = []
+            
+            for i, msg in enumerate(messages, 1):
+                try:
+                    subject = decode_header_safe(msg.get('Subject', '')) or f'message_{i}'
+                    safe_name = sanitize_filename(f"{i}_{subject}")
+                    eml_path = os.path.join(self.output_dir, f"{safe_name}.eml")
+                    
+                    with open(eml_path, 'wb') as f:
+                        f.write(msg.as_bytes())
+                    
+                    converted.append(eml_path)
+                except Exception as e:
+                    logger.error(f"Ошибка конвертации сообщения {i} из MBOX: {str(e)}")
+                    continue
+                    
+            return converted
+            
+        except Exception as e:
+            logger.error(f"Ошибка конвертации MBOX файла {mbox_path}: {str(e)}")
+            raise
+
+    def encode_header(self, text):
+        if not text:
+            return ""
+        
+        try:
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
+            
+            if any(ord(c) > 127 for c in text):
+                from email.header import Header
+                return str(Header(text, 'utf-8'))
+            
+            return text
+        except Exception as e:
+            logger.error(f"Ошибка кодирования заголовка: {e}")
+            return str(text)
+
+def load_config():
+    default_config = {
+        "output_dir": os.path.expanduser("~/EML_Export"),
+        "dark_theme": True
+    }
+
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                for key in default_config:
+                    if key in config:
+                        default_config[key] = config[key]
+        except Exception as e:
+            logger.error(f"Ошибка загрузки конфигурации: {e}")
+
+    return default_config
+
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения конфигурации: {e}")
+
+def detect_encoding(file_path):
+    encodings = ['utf-8', 'cp1251', 'koi8-r', 'iso-8859-1', 'cp866', 'latin1']
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                f.read(1024)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    return 'utf-8'
+
+def safe_mbox_loader(mbox_path):
+    messages = []
+    try:
+        mbox = mailbox.mbox(mbox_path)
+        return list(mbox)
+    except UnicodeDecodeError:
+        pass
+
+    encoding = detect_encoding(mbox_path)
+    try:
+        with open(mbox_path, 'r', encoding=encoding, errors='replace') as f:
+            content = f.read()
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.mbox', delete=False, encoding='utf-8') as tmp_file:
+            tmp_file.write(content)
+            tmp_path = tmp_file.name
+        try:
+            mbox = mailbox.mbox(tmp_path)
+            messages = list(mbox)
+        finally:
+            os.unlink(tmp_path)
+        return messages
+    except Exception as e:
+        try:
+            return parse_mbox_manually(mbox_path, encoding)
+        except:
+            raise Exception(f"Не удалось загрузить MBOX файл: {str(e)}")
+
+def parse_mbox_manually(mbox_path, encoding='utf-8'):
+    messages = []
+    with open(mbox_path, 'r', encoding=encoding, errors='replace') as f:
+        content = f.read()
+    parts = re.split(r'^From ', content, flags=re.MULTILINE)
+    for i, part in enumerate(parts):
+        if i == 0 and not part.strip():
+            continue
+        if i > 0:
+            part = 'From ' + part
+        try:
+            msg = email.message_from_string(part)
+            if msg.get('Subject') or msg.get('From'):
+                messages.append(msg)
+        except:
+            continue
+    return messages
+
+def save_attachment(data, filename, parent=None):
+    try:
+        save_path, _ = QFileDialog.getSaveFileName(parent, "Сохранить вложение", filename)
+        if save_path:
+            with open(save_path, "wb") as f:
+                f.write(data)
+            QMessageBox.information(parent, "Успех", f"Файл сохранён: {save_path}")
+    except Exception as e:
+        QMessageBox.warning(parent, "Ошибка", f"Не удалось сохранить: {str(e)}")
+
+def save_attachments_bulk(attachments, parent=None):
+    try:
+        dir_path = QFileDialog.getExistingDirectory(parent, "Выберите папку для сохранения")
+        if dir_path:
+            for name, data in attachments:
+                path = os.path.join(dir_path, name)
+                with open(path, "wb") as f:
+                    f.write(data)
+            QMessageBox.information(parent, "Успех", f"Вложения сохранены в: {dir_path}")
+    except Exception as e:
+        QMessageBox.warning(parent, "Ошибка", f"Не удалось сохранить вложения: {str(e)}")
+
+def inline_cid_images(html, attachments):
+    if not html or not attachments:
+        return html
+
+    def repl(match):
+        src = match.group(1)
+        if src.lower().startswith("cid:"):
+            cid = src[4:]
+            for att in attachments:
+                att_cid = getattr(att, "cid", getattr(att, "contentId", None))
+                if att_cid and att_cid.strip("<>") == cid:
+                    data = att.data
+                    mime_type, _ = mimetypes.guess_type(att.longFilename or att.shortFilename or "image.png")
+                    if not mime_type:
+                        mime_type = "image/png"
+                    b64 = base64.b64encode(data).decode("utf-8")
+                    return f'<img src="data:{mime_type};base64,{b64}">'
+        return match.group(0)
+
+    return re.sub(r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>', repl, html, flags=re.IGNORECASE)
+
+def sanitize_filename(filename):
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+    filename = filename.strip('. ')
+    if len(filename) > 100:
+        filename = filename[:100]
+    if not filename:
+        filename = "no_subject"
+    return filename
+
+def decode_header_safe(header_value):
+    if not header_value:
+        return ""
+    try:
+        decoded_parts = decode_header(header_value)
+        result = ""
+        for part, encoding in decoded_parts:
+            if isinstance(part, bytes):
+                if encoding:
+                    try:
+                        result += part.decode(encoding)
+                    except (UnicodeDecodeError, LookupError):
+                        result += part.decode('utf-8', errors="replace")
+                else:
+                    for enc in ['utf-8', 'cp1251', 'koi8-r', 'iso-8859-1']:
+                        try:
+                            result += part.decode(enc)
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    else:
+                        result += part.decode('utf-8', errors="replace")
+            else:
+                result += str(part)
+        return result
+    except:
+        return str(header_value)
+
+class DragDropListWidget(QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragEnabled(False)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QListWidget.DropOnly)
+        self.setDefaultDropAction(Qt.CopyAction)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if file_path.lower().endswith(('.msg', '.mbox')):
+                    self.addItem(file_path)
+            event.acceptProposedAction()
+
+
+class ConversionWorker(QThread):
+    progress = pyqtSignal(int)
+    error = pyqtSignal(str, str)
+    finished = pyqtSignal()
+
+    def __init__(self, files, output_dir, converter_instance):
+        super().__init__()
+        self.files = files
+        self.output_dir = output_dir
+        self.converter = converter_instance
+
+    def run(self):
+        total_files = len(self.files)
+        for i, file_path in enumerate(self.files):
+            try:
+                if file_path.lower().endswith(".msg"):
+                    self.converter.convert_msg_to_eml(file_path)
+                elif file_path.lower().endswith(".mbox"):
+                    self.converter.convert_mbox_to_eml(file_path)
+            except Exception as e:
+                self.error.emit(file_path, str(e))
+            self.progress.emit(int((i + 1) / total_files * 100))
+        self.finished.emit()
+
+
+class PreviewDialog(QDialog):
+    def __init__(self, title, msg_obj, msg_path, converter, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setFixedSize(900, 720)
+        self.converter = converter
+        self.msg_path = msg_path
+
+        layout = QVBoxLayout(self)
+
+        subject = getattr(msg_obj, "subject", "") or ""
+        sender = getattr(msg_obj, "sender", "") or ""
+        to = getattr(msg_obj, "to", "") or self.get_safe_recipients(getattr(msg_obj, "recipients", None))
+        date = getattr(msg_obj, "date", "") or ""
+
+        self.info_label = QLabel(
+            f"<b>От:</b> {sender}<br><b>Кому:</b> {to}<br><b>Тема:</b> {subject}<br><b>Дата:</b> {date}"
+        )
+        self.info_label.setMaximumHeight(84)
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        switch_layout = QHBoxLayout()
+        self.radio_text = QRadioButton("Текст")
+        self.radio_html = QRadioButton("HTML")
+        self.radio_text.setChecked(True)
+        switch_layout.addWidget(self.radio_text)
+        switch_layout.addWidget(self.radio_html)
+
+        self.btn_convert = QPushButton("Конвертировать в EML")
+        self.btn_convert.setObjectName("primaryButton")
+        self.btn_convert.setToolTip("Сохранить это письмо как .eml")
+        switch_layout.addStretch()
+        switch_layout.addWidget(self.btn_convert)
+        layout.addLayout(switch_layout)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setMaximumHeight(360)
+        layout.addWidget(self.text_edit)
+
+        layout.addWidget(QLabel("Вложения:"))
+        self.attach_list = QListWidget()
+        self.attach_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.attach_list.setMaximumHeight(150)
+        layout.addWidget(self.attach_list)
+
+        btn_layout = QHBoxLayout()
+        self.btn_save_one = QPushButton("Сохранить выбранное вложение")
+        self.btn_save_all = QPushButton("Сохранить все вложения")
+        btn_layout.addWidget(self.btn_save_one)
+        btn_layout.addWidget(self.btn_save_all)
+        layout.addLayout(btn_layout)
+
+        self.body_text = getattr(msg_obj, "body", "") or ""
+        self.body_html = getattr(msg_obj, "htmlBody", "") or b""
+
+        self.attachments = []
+        for att in msg_obj.attachments:
+            name = att.longFilename or att.shortFilename or "attachment.bin"
+            data = att.data
+            self.attachments.append((name, data))
+            self.attach_list.addItem(name)
+
+        if self.body_html:
+            if isinstance(self.body_html, bytes):
+                html_str = self.body_html.decode("utf-8", errors="replace")
+            else:
+                html_str = str(self.body_html)
+            self.body_html = inline_cid_images(html_str, msg_obj.attachments)
+
+        self.update_body()
+
+        self.radio_text.toggled.connect(self.update_body)
+        self.btn_save_one.clicked.connect(self.save_selected_attachment)
+        self.btn_save_all.clicked.connect(lambda: save_attachments_bulk(self.attachments, self))
+        self.btn_convert.clicked.connect(self.convert_current_msg)
+
+    def get_safe_recipients(self, recipients):
+        if not recipients:
+            return ""
+        return ", ".join([getattr(r, "email", None) or getattr(r, "display_name", "Unknown") for r in recipients])
+
+    def update_body(self):
+        if self.radio_text.isChecked():
+            if isinstance(self.body_text, bytes):
+                text_str = self.body_text.decode("utf-8", errors="replace")
+            else:
+                text_str = str(self.body_text)
+            self.text_edit.setPlainText(text_str[:10000])
+        else:
+            self.text_edit.setHtml(self.body_html if self.body_html else "<i>(Нет HTML-версии)</i>")
+
+    def save_selected_attachment(self):
+        item = self.attach_list.currentItem()
+        if item:
+            idx = self.attach_list.row(item)
+            name, data = self.attachments[idx]
+            save_attachment(data, name, self)
+
+    def convert_current_msg(self):
+        try:
+            self.converter.convert_msg_to_eml(self.msg_path)
+            base = os.path.basename(self.msg_path)
+            QMessageBox.information(self, "Готово", f"Письмо '{base}' сконвертировано в EML и сохранено в:\n{self.converter.output_dir}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось конвертировать:\n{str(e)}")
+
+
+class MboxPreviewDialog(QDialog):
+    def __init__(self, mbox_path, converter, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Предпросмотр MBOX: {os.path.basename(mbox_path)}")
+        self.setFixedSize(1200, 720)
+        self.converter = converter
+        self.mbox_path = mbox_path
+
+        layout = QHBoxLayout(self)
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget, 3)
+
+        right_layout = QVBoxLayout()
+        self.info_label = QLabel("Выберите письмо из списка")
+        self.info_label.setMaximumHeight(84)
+        self.info_label.setWordWrap(True)
+        right_layout.addWidget(self.info_label)
+
+        switch_layout = QHBoxLayout()
+        self.radio_text = QRadioButton("Текст")
+        self.radio_html = QRadioButton("HTML")
+        self.radio_text.setChecked(True)
+        switch_layout.addWidget(self.radio_text)
+        switch_layout.addWidget(self.radio_html)
+
+        self.btn_convert_one = QPushButton("Конвертировать выбранное письмо")
+        self.btn_convert_one.setObjectName("primaryButton")
+        self.btn_convert_one.setToolTip("Сохранить текущее письмо как .eml")
+
+        self.btn_convert_all = QPushButton("Конвертировать все письма MBOX")
+        self.btn_convert_all.setObjectName("primaryButton")
+        self.btn_convert_all.setToolTip("Сохранить весь MBOX в виде набора .eml")
+
+        switch_layout.addStretch()
+        switch_layout.addWidget(self.btn_convert_one)
+        switch_layout.addWidget(self.btn_convert_all)
+        right_layout.addLayout(switch_layout)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setMinimumHeight(360)
+        self.text_edit.setMaximumHeight(400)
+        right_layout.addWidget(self.text_edit)
+
+        right_layout.addWidget(QLabel("Вложения:"))
+        self.attach_list = QListWidget()
+        self.attach_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.attach_list.setMaximumHeight(120)
+        right_layout.addWidget(self.attach_list)
+
+        btn_layout = QHBoxLayout()
+        self.btn_save_one = QPushButton("Сохранить выбранное")
+        self.btn_save_all = QPushButton("Сохранить все")
+        btn_layout.addWidget(self.btn_save_one)
+        btn_layout.addWidget(self.btn_save_all)
+        right_layout.addLayout(btn_layout)
+
+        layout.addLayout(right_layout, 7)
+
+        try:
+            self.messages = safe_mbox_loader(mbox_path)
+            if not self.messages:
+                QMessageBox.warning(parent, "Предупреждение", "MBOX файл не содержит писем или поврежден")
+                return
+            for i, msg in enumerate(self.messages, start=1):
+                try:
+                    subject = decode_header_safe(msg.get("Subject", "")) or "(без темы)"
+                    sender = decode_header_safe(msg.get("From", "")) or "(без отправителя)"
+                    if len(subject) > 50:
+                        subject = subject[:47] + "..."
+                    if len(sender) > 30:
+                        sender = sender[:27] + "..."
+                    item = QListWidgetItem(f"{i}. {subject} — {sender}")
+                    item.setData(Qt.UserRole, i - 1)
+                    self.list_widget.addItem(item)
+                except Exception:
+                    item = QListWidgetItem(f"{i}. (ошибка декодирования письма)")
+                    item.setData(Qt.UserRole, i - 1)
+                    self.list_widget.addItem(item)
+        except Exception as e:
+            QMessageBox.warning(parent, "Ошибка", f"Не удалось загрузить MBOX файл:\n{str(e)}")
+            self.messages = []
+
+        self.list_widget.itemClicked.connect(self.show_message)
+        self.radio_text.toggled.connect(self.update_body)
+        self.btn_save_one.clicked.connect(self.save_selected_attachment)
+        self.btn_save_all.clicked.connect(self.save_all_attachments)
+        self.btn_convert_one.clicked.connect(self.convert_selected_message)
+        self.btn_convert_all.clicked.connect(self.convert_all_messages_from_dialog)
+
+        self.current_body_text = ""
+        self.current_body_html = ""
+        self.attachments = []
+
+    def decode_header_safe(self, header_value):
+        return decode_header_safe(header_value)
+
+    def decode_payload_safe(self, part):
+        try:
+            payload = part.get_payload(decode=True)
+            if isinstance(payload, bytes):
+                charset = part.get_content_charset()
+                if charset:
+                    try:
+                        return payload.decode(charset)
+                    except (UnicodeDecodeError, LookupError):
+                        pass
+                for encoding in ['utf-8', 'cp1251', 'koi8-r', 'iso-8859-1', 'cp866']:
+                    try:
+                        return payload.decode(encoding)
+                    except UnicodeDecodeError:
+                        continue
+                return payload.decode('utf-8', errors='replace')
+            else:
+                return str(payload)
+        except:
+            try:
+                payload = part.get_payload()
+                return str(payload)
+            except:
+                return "(не удалось декодировать содержимое)"
+
+    def show_message(self, item):
+        index = item.data(Qt.UserRole)
+        if index >= len(self.messages):
+            self.info_label.setText("Ошибка: письмо не найдено")
+            return
+            
+        msg = self.messages[index]
+        try:
+            subject = self.decode_header_safe(msg.get("Subject", ""))
+            sender = self.decode_header_safe(msg.get("From", ""))
+            to = self.decode_header_safe(msg.get("To", ""))
+            date = self.decode_header_safe(msg.get("Date", ""))
+        except Exception:
+            subject = sender = to = date = "(ошибка декодирования)"
+            
+        self.info_label.setText(
+            f"<b>От:</b> {sender}<br>"
+            f"<b>Кому:</b> {to}<br>"
+            f"<b>Тема:</b> {subject}<br>"
+            f"<b>Дата:</b> {date}"
+        )
+
+        text, html = "", ""
+        attachments = []
+        
+        try:
+            if msg.is_multipart():
+                for part in msg.walk():
+                    try:
+                        ctype = part.get_content_type()
+                        disp = str(part.get("Content-Disposition", "")).lower()
+                        
+                        if ctype == "text/plain" and "attachment" not in disp:
+                            text = self.decode_payload_safe(part)
+                        elif ctype == "text/html" and "attachment" not in disp:
+                            html = self.decode_payload_safe(part)
+                        elif "attachment" in disp or part.get_filename():
+                            fname = part.get_filename() or "attachment.bin"
+                            fname = self.decode_header_safe(fname)
+                            try:
+                                data = part.get_payload(decode=True)
+                                if data:
+                                    attachments.append((fname, data))
+                            except:
+                                pass
+                    except Exception:
+                        continue
+            else:
+                text = self.decode_payload_safe(msg)
+        except Exception as e:
+            text = f"(Ошибка декодирования содержимого: {str(e)})"
+
+        self.current_body_text = text
+        self.current_body_html = html
+        self.attachments = attachments
+        
+        self.attach_list.clear()
+        for fname, _ in attachments:
+            self.attach_list.addItem(fname)
+            
+        self.update_body()
+
+    def update_body(self):
+        if self.radio_text.isChecked():
+            self.text_edit.setPlainText(self.current_body_text[:10000])
+        else:
+            self.text_edit.setHtml(self.current_body_html if self.current_body_html else "<i>(Нет HTML-версии)</i>")
+
+    def save_selected_attachment(self):
+        item = self.attach_list.currentItem()
+        if item:
+            idx = self.attach_list.row(item)
+            name, data = self.attachments[idx]
+            save_attachment(data, name, self)
+
+    def save_all_attachments(self):
+        if self.attachments:
+            save_attachments_bulk(self.attachments, self)
+        else:
+            QMessageBox.information(self, "Информация", "Нет вложений для сохранения")
+
+    def convert_selected_message(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            QMessageBox.warning(self, "Нет выбора", "Выберите письмо слева в списке.")
+            return
+        
+        idx = item.data(Qt.UserRole)
+        if idx is None or idx >= len(self.messages):
+            QMessageBox.warning(self, "Ошибка", "Неверный индекс письма.")
+            return
+            
+        try:
+            msg = self.messages[idx]
+            subject = decode_header_safe(msg.get("Subject", "")) or f"message_{idx+1:03d}"
+            clean_subject = sanitize_filename(subject)
+            
+            eml_name = f"{clean_subject}.eml"
+            eml_path = os.path.join(self.converter.output_dir, eml_name)
+            
+            counter = 1
+            while os.path.exists(eml_path):
+                eml_name = f"{clean_subject}_{counter}.eml"
+                eml_path = os.path.join(self.converter.output_dir, eml_name)
+                counter += 1
+            
+            Path(self.converter.output_dir).mkdir(parents=True, exist_ok=True)
+            
+            with open(eml_path, 'wb') as f:
+                generator = email.generator.BytesGenerator(f, policy=email.policy.SMTP)
+                generator.flatten(msg)
+                
+            QMessageBox.information(self, "Готово", 
+                                  f"Письмо сохранено как:\n{eml_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", 
+                             f"Не удалось конвертировать письмо:\n{str(e)}")
+
+    def convert_all_messages_from_dialog(self):
+        try:
+            Path(self.converter.output_dir).mkdir(parents=True, exist_ok=True)
+            converted = 0
+            
+            for i, msg in enumerate(self.messages):
+                try:
+                    subject = decode_header_safe(msg.get("Subject", "")) or f"message_{i+1:03d}"
+                    clean_subject = sanitize_filename(subject)
+                    
+                    eml_name = f"{clean_subject}.eml"
+                    eml_path = os.path.join(self.converter.output_dir, eml_name)
+                    
+                    counter = 1
+                    while os.path.exists(eml_path):
+                        eml_name = f"{clean_subject}_{counter}.eml"
+                        eml_path = os.path.join(self.converter.output_dir, eml_name)
+                        counter += 1
+                    
+                    with open(eml_path, 'wb') as f:
+                        generator = email.generator.BytesGenerator(f, policy=email.policy.SMTP)
+                        generator.flatten(msg)
+                    converted += 1
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка конвертации письма {i+1}: {str(e)}")
+                    continue
+            
+            QMessageBox.information(self, "Готово", 
+                f"Сконвертировано писем: {converted}\nПапка: {self.converter.output_dir}")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", 
+                f"Ошибка при конвертации писем:\n{str(e)}")
+
+
+
+class MsgToEmlConverter(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MSG and MBOX → EML Конвертер")
+        self.resize(680, 480)
+
+        self.config = load_config()
+        self.output_dir = self.config["output_dir"]
+        
+        self.converter = MessageConverter(self.output_dir)
+
+        self.conversion_worker = None
+        
+        self.preview_selected_file = self.preview_selected_file  # Add this line
+        self.preview_file = self.preview_file  # Add this line
+        
+        self.init_ui()
+
+        if self.config.get("dark_theme", True):
+            self.set_dark_theme()
+            self.theme_checkbox.setChecked(True)
+        else:
+            self.set_light_theme()
+            self.theme_checkbox.setChecked(False)
+
+    def preview_selected_file(self):
+        current_item = self.list_widget.currentItem()
+        if current_item:
+            self.preview_file(current_item)
+        else:
+            QMessageBox.warning(self, "Предупреждение", "Выберите файл для предпросмотра")
+
+    def preview_file(self, item):
+        file_path = item.text()
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "Ошибка", "Файл не найден")
+            return
+
+        try:
+            if file_path.lower().endswith('.msg'):
+                msg = extract_msg.Message(file_path)
+                dialog = PreviewDialog("Предпросмотр MSG", msg, file_path, self.converter, self)
+                dialog.exec_()
+            elif file_path.lower().endswith('.mbox'):
+                dialog = MboxPreviewDialog(file_path, self.converter, self)
+                dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл:\n{str(e)}")
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        top_bar = QHBoxLayout()
+        self.label = QLabel("Перетащите файлы .msg или .mbox, или выберите вручную:")
+        top_bar.addWidget(self.label)
+
+        self.preview_button = QPushButton("📋 Предпросмотр")
+        self.preview_button.setToolTip("Открыть предпросмотр для выделенного файла")
+        self.preview_button.clicked.connect(self.preview_selected_file)
+        top_bar.addWidget(self.preview_button)
+
+        self.settings_button = QToolButton()
+        self.settings_button.setIcon(QIcon.fromTheme("preferences-system"))
+        self.settings_button.setPopupMode(QToolButton.InstantPopup)
+        self.setup_settings_menu()
+        top_bar.addStretch()
+        top_bar.addWidget(self.settings_button)
+        layout.addLayout(top_bar)
+
+        self.list_widget = DragDropListWidget()
+        self.list_widget.itemDoubleClicked.connect(self.preview_file)
+        layout.addWidget(self.list_widget)
+
+        btn_layout = QHBoxLayout()
+        self.clear_button = QPushButton("🗑️ Очистить список")
+        self.clear_button.clicked.connect(self.list_widget.clear)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.clear_button)
+        layout.addLayout(btn_layout)
+
+        self.select_button = QPushButton("Выбрать MSG-файлы")
+        self.select_button.clicked.connect(self.select_files)
+        layout.addWidget(self.select_button)
+
+        self.mbox_button = QPushButton("Выбрать MBOX-файлы")
+        self.mbox_button.clicked.connect(self.select_mbox_files)
+        layout.addWidget(self.mbox_button)
+
+        self.convert_button = QPushButton("Конвертировать")
+        self.convert_button.setObjectName("primaryButton")
+        self.convert_button.clicked.connect(self.convert_all)
+        layout.addWidget(self.convert_button)
+
+        self.output_info = QLabel(f"Файлы будут сохранены в: {self.output_dir}")
+        layout.addWidget(self.output_info)
+
+        self.progress = QProgressBar()
+        self.progress.setAlignment(Qt.AlignCenter)
+        self.progress.setFormat("%p%")
+        layout.addWidget(self.progress)
+
+    def preview_selected_file(self):
+        current_item = self.list_widget.currentItem()
+        if current_item:
+            self.preview_file(current_item)
+        else:
+            QMessageBox.warning(self, "Предупреждение", "Выберите файл для предпросмотра")
+
+    def preview_file(self, item):
+        file_path = item.text()
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "Ошибка", "Файл не найден")
+            return
+
+        try:
+            if file_path.lower().endswith('.msg'):
+                msg = extract_msg.Message(file_path)
+                dialog = PreviewDialog("Предпросмотр MSG", msg, file_path, self.converter, self)
+                dialog.exec_()
+            elif file_path.lower().endswith('.mbox'):
+                dialog = MboxPreviewDialog(file_path, self.converter, self)
+                dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл:\n{str(e)}")
+
+    def setup_settings_menu(self):
+        menu = QMenu(self)
+        
+        self.theme_checkbox = QAction("Тёмная тема", menu)
+        self.theme_checkbox.setCheckable(True)
+        self.theme_checkbox.toggled.connect(self.toggle_theme)
+        menu.addAction(self.theme_checkbox)
+        
+        change_output = QAction("Изменить папку сохранения", menu)
+        change_output.triggered.connect(self.select_output_dir)
+        menu.addAction(change_output)
+        
+        self.settings_button.setMenu(menu)
+
+    def toggle_theme(self, checked):
+        if checked:
+            self.set_dark_theme()
+        else:
+            self.set_light_theme()
+        self.config["dark_theme"] = checked
+        save_config(self.config)
+
+    def set_dark_theme(self):
+        app = QApplication.instance()
+        app.setStyleSheet("""
+            QWidget {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QPushButton {
+                background-color: #3b3b3b;
+                border: 1px solid #555555;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #454545;
+            }
+            QPushButton#primaryButton {
+                background-color: #0d47a1;
+            }
+            QPushButton#primaryButton:hover {
+                background-color: #1565c0;
+            }
+            QListWidget {
+                border: 1px solid #555555;
+            }
+            QProgressBar {
+                border: 1px solid #555555;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #0d47a1;
+            }
+        """)
+
+    def set_light_theme(self):
+        app = QApplication.instance()
+        app.setStyleSheet("""
+            QWidget {
+                background-color: #f0f0f0;
+                color: #000000;
+            }
+            QPushButton {
+                background-color: #ffffff;
+                border: 1px solid #cccccc;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #e6e6e6;
+            }
+            QPushButton#primaryButton {
+                background-color: #1976d2;
+                color: white;
+            }
+            QPushButton#primaryButton:hover {
+                background-color: #1565c0;
+            }
+            QListWidget {
+                border: 1px solid #cccccc;
+            }
+            QProgressBar {
+                border: 1px solid #cccccc;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #1976d2;
+            }
+        """)
+
+    def select_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Выберите MSG файлы", "",
+            "MSG файлы (*.msg);;Все файлы (*.*)"
+        )
+        if files:
+            self.list_widget.addItems(files)
+
+    def select_mbox_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Выберите MBOX файлы", "",
+            "MBOX файлы (*.mbox *.mbx);;Все файлы (*.*)"
+        )
+        if files:
+            self.list_widget.addItems(files)
+
+    def select_output_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Выберите папку для сохранения",
+            self.output_dir
+        )
+        if dir_path:
+            self.output_dir = dir_path
+            self.output_info.setText(f"Файлы будут сохранены в: {self.output_dir}")
+            self.config["output_dir"] = dir_path
+            save_config(self.config)
+
+    def convert_all(self):
+        files = [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
+        if not files:
+            QMessageBox.warning(self, "Предупреждение", "Добавьте файлы для конвертации")
+            return
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        self.conversion_worker = ConversionWorker(files, self.output_dir, self.converter)
+        self.conversion_worker.progress.connect(self.progress.setValue)
+        self.conversion_worker.error.connect(self.show_error)
+        self.conversion_worker.finished.connect(self.conversion_finished)
+        
+        self.convert_button.setEnabled(False)
+        self.progress.setValue(0)
+        self.conversion_worker.start()
+
+    def show_error(self, file_path, error_msg):
+        QMessageBox.warning(
+            self, "Ошибка конвертации",
+            f"Ошибка при конвертации {file_path}:\n{error_msg}"
+        )
+
+    def conversion_finished(self):
+        self.convert_button.setEnabled(True)
+        self.progress.setValue(100)
+        QMessageBox.information(
+            self, "Готово",
+            f"Конвертация завершена.\nФайлы сохранены в:\n{self.output_dir}"
+        )
+
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("MSG AND MBOX to EML Converter")
+    window = MsgToEmlConverter()
+    window.show()
+    sys.exit(app.exec_())
